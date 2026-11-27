@@ -1,48 +1,21 @@
 # Remittance Stablecoin (SPL Token-2022)
 
-Rust implementation and integration test suite for a Token-2022 remittance stablecoin covering stacked mint extensions, epoch-based transfer fees, per-account KYC thawing, confidential transfers with manual approval, permanent delegate seizure, and a minimal on-chain delegated transfer program verified under CPI Guard.
+A Rust workspace for issuing and transferring a Token-2022 remittance stablecoin.
 
-## Workspace Layout
+## Mint and transfers
 
-- `stablecoin/src/mint.rs`:
-  - `create_remittance_mint_instructions`: Creates a mint stacking `TransferFeeConfig`, `MetadataPointer` (pointing to the mint itself), `DefaultAccountState::Frozen`, and `MintCloseAuthority`. Sizes the account with `ExtensionType::try_calculate_account_len::<Mint>`, orders all extension initializations before `initialize_mint2`, and initializes on-chain `TokenMetadata` afterward.
-  - `reissue_confidential_mint_instructions`: Re-issues the mint with the same extension set plus `PermanentDelegate`, `ConfidentialTransferMint` (`auto_approve_new_accounts = false`), and `ConfidentialTransferFeeConfig`.
-- `stablecoin/src/transfer.rs`:
-  - `transfer_with_epoch_fee`: Reads `TransferFeeConfig` via `StateWithExtensions::<Mint>::unpack`, computes the fee with `calculate_epoch_fee(current_epoch, amount)`, and builds `transfer_checked_with_fee`.
-  - `thaw_after_kyc`: Thaws an individual token account using the freeze authority without modifying the mint's `DefaultAccountState`.
-- `stablecoin/src/state.rs`: Reads mint and token account state exclusively through `StateWithExtensions`.
-- `stablecoin/src/confidential.rs`: Full confidential transfer lifecycle (`ConfigureAccount` with owner-only `reallocate`, `ApproveAccount`, `Deposit`, `ApplyPendingBalance`, `TransferWithFee` using ZK proof context state accounts, and `Withdraw`).
-- `programs/delegated-transfer/src/lib.rs` computes the epoch fee and calls Token-2022 via CPI. The delegate PDA is derived from the source and destination token accounts.
-- `stablecoin/tests/integration.rs`: End-to-end `solana-program-test` suite exercising all tasks, the permanent delegate vs confidential balance gap, and the CPI Guard delegated-transfer extension challenge.
+- [Mint](stablecoin/src/mint.rs) sizes the account with `ExtensionType::try_calculate_account_len`. It initializes transfer fees, a metadata pointer to the mint, frozen-by-default accounts, and a close authority before `InitializeMint2`. It writes token metadata after mint initialization.
+- [Transfers](stablecoin/src/transfer.rs) use `transfer_checked_with_fee` and compute the expected fee with `calculate_epoch_fee(current_epoch, amount)`. After KYC, the freeze authority thaws the individual account. [State readers](stablecoin/src/state.rs) use `StateWithExtensions`.
+- The reissued mint keeps the original extensions and adds `PermanentDelegate`, `ConfidentialTransferMint`, and `ConfidentialTransferFeeConfig`. The token account owner configures confidential transfers after ATA creation. The issuer approves the account manually.
+- [Confidential transfers](stablecoin/src/confidential.rs) deposit public tokens into the pending balance, apply pending funds, transfer with encrypted fees, and withdraw back to the public balance. The recipient applies pending funds before withdrawing.
 
-## Written Finding: Permanent Delegate vs. Confidential Balances
+## Seizure after a confidential deposit
 
-### What happens if a sanctioned user moves their balance into the confidential system before the permanent delegate acts?
+The permanent delegate can seize the public balance. A deposit moves the deposited amount out of that balance and into the encrypted pending balance. The funds stay beyond the delegate's reach after the owner applies them to the available balance.
 
-The permanent delegate can seize any remaining public balance. Deposited funds sit in the encrypted pending balance and remain beyond the delegate's reach after the owner applies them to the available balance.
+Confidential transfers and withdrawals require the account owner's authorization and proofs about the encrypted balance. The auditor key can reveal transfer amounts and carries no spending authority. The issuer can freeze the token account to block further movement of the funds.
 
-In Token-2022, a token account configured for confidential transfers maintains two separate balance domains:
-
-1. **Public balance** (`Account.amount`): Plaintext `u64` balance.
-2. **Confidential balance** (`ConfidentialTransferAccount.pending_balance` and `available_balance`): Twisted ElGamal ciphertexts encrypted under the token account owner's ElGamal public key, paired with an AES-encrypted `decryptable_available_balance`.
-
-`PermanentDelegate` authorizes `Transfer`, `TransferChecked`, `TransferCheckedWithFee`, and `Burn` against the public `Account.amount` without requiring the account owner's signature. When a sanctioned user calls `DepositConfidentialTokens`, their public `Account.amount` is debited down to `0` and the equivalent value is credited into the encrypted `pending_balance` (and then moved to `available_balance` via `ApplyPendingBalance`).
-
-Once funds are in the confidential balance:
-
-- Any public `transfer_checked_with_fee` or `burn` invoked by the `PermanentDelegate` fails with insufficient funds because `Account.amount` is `0`.
-- Confidential transfers and withdrawals require the token account owner's authorization and proofs about the encrypted balance. The permanent delegate extension grants neither confidential spending authority nor access to the owner's keys.
-- Configuring an `auditor_elgamal_pubkey` on `ConfidentialTransferMint` does not close this gap. The auditor key only allows decrypting individual transfer ciphertexts for visibility; it cannot spend funds, withdraw them back to public balance, or authorize a seizure.
-
-### Practical Implications and Mitigations
-
-Adding both `PermanentDelegate` and `ConfidentialTransferMint` to the same mint creates an enforcement gap: seizure only works on public balances. Once a user enters the confidential balance, the issuer's remaining on-chain control is containment rather than recovery:
-
-- **Freeze the account** (`FreezeAccount`): Blocks further confidential transfers, deposits, and withdrawals, locking the funds in place even though they cannot be moved to a seizure address.
-- **Gate confidential entry** (`auto_approve_new_accounts = false`): Manual approval (`ApproveAccount`) ensures accounts cannot deposit into or receive confidential balances until KYC and sanctions screening complete.
-- **Limit confidential eligibility** to accounts where freezing is an acceptable enforcement option. Keep settlement public where the issuer must be able to move the full balance under the permanent delegate authority.
-
-This behavior is directly demonstrated in `test_reissued_confidential_lifecycle_and_seizure_gap` in `stablecoin/tests/integration.rs`, where the permanent delegate fails to seize Alice's confidential balance after deposit (`Account.amount == 0`) while succeeding against Bob's withdrawn public balance.
+The [integration test](stablecoin/tests/integration.rs) shows the delegate's seizure failing after Alice deposits her full public balance and succeeding against Bob's withdrawn public balance.
 
 ## Extension Challenge: Delegated Transfer with CPI Guard
 
