@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "stablecoin",
+    "programs/delegated-transfer",
+]
+resolver = "2"
